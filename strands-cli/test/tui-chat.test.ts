@@ -1313,7 +1313,7 @@ describe('ChatController', () => {
     })
   })
 
-  it('sets effort from /effort and opens the model panel focused on the slider without an argument', async () => {
+  it('sets effort from /effort and opens an effort-only panel without an argument', async () => {
     const target = backend()
     let effort = 'high'
     target.info = () => ({ model: 'global.anthropic.claude-opus-4-8', effort: effort === 'low' ? 'Low' : 'High' })
@@ -1338,12 +1338,32 @@ describe('ChatController', () => {
 
     await controller.submit('/effort')
     expect(controller.getSnapshot().panel).toMatchObject({
-      kind: 'models',
+      kind: 'effort',
+      rows: [],
       slider: { focused: true, options: [{ id: 'low', active: true }, { id: 'high' }] },
     })
+    expect(target.listModels).not.toHaveBeenCalled()
+
+    await controller.activatePanelRow({ label: 'Effort', description: 'High', value: 'effort:high' })
+    expect(target.setEffort).toHaveBeenLastCalledWith('high')
+    expect(controller.getSnapshot().panel?.slider?.options).toEqual([
+      { id: 'low', label: 'Low' },
+      expect.objectContaining({ id: 'high', active: true }),
+    ])
 
     await controller.submit('/model')
     expect(controller.getSnapshot().panel?.slider?.focused).toBeUndefined()
+  })
+
+  it('reports /effort as unavailable when the model has no effort levels', async () => {
+    const target = backend()
+    target.info = () => ({ model: 'ollama/llama3.2' })
+    target.listEfforts = () => []
+    const controller = new ChatController(target)
+
+    await controller.submit('/effort')
+
+    expect(controller.getSnapshot().panel).toMatchObject({ kind: 'error', title: 'effort unavailable' })
   })
 
   it('reports an unsupported /effort level as an error', async () => {
@@ -1749,8 +1769,8 @@ describe('ChatController', () => {
         kind: 'permissions',
         title: 'permissions',
         rows: [
-          { label: 'Default (HITL)', badge: { text: 'Active' } },
-          { label: 'Bypass', tone: 'danger' },
+          { label: 'Ask when needed (HITL)', badge: { text: 'Active' } },
+          { label: 'Allow all tools', tone: 'danger' },
           { label: 'bash', control: { kind: 'toggle', checked: true } },
           { label: 'write', control: { kind: 'toggle', checked: false } },
           { label: 'config', description: '/Users/test/.strands/cli/config.json' },
@@ -1758,13 +1778,24 @@ describe('ChatController', () => {
       },
     })
     expect(controller.getSnapshot().panel?.body).toBeUndefined()
+    const permissionsPanelId = controller.getSnapshot().panel?.id
 
     await controller.activatePanelRow(controller.getSnapshot().panel!.rows[1]!)
     expect(target.setPermissionMode).toHaveBeenCalledWith('bypassPermissions')
+    expect(controller.getSnapshot().panel?.id).toBe(permissionsPanelId)
     expect(controller.getSnapshot().panel?.body).toContain('WARNING')
+    const bypassedToolRows = controller.getSnapshot().panel?.rows.slice(2, 4) ?? []
+    expect(bypassedToolRows).toMatchObject([
+      { label: 'bash', control: { kind: 'toggle', checked: true } },
+      { label: 'write', control: { kind: 'toggle', checked: true } },
+    ])
+    expect(bypassedToolRows.every((row) => row.value === undefined)).toBe(true)
 
+    await controller.submit('/permissions default')
+    expect(controller.getSnapshot().panel?.id).toBe(permissionsPanelId)
     await controller.activatePanelRow(controller.getSnapshot().panel!.rows[3]!)
     expect(target.allowPermission).toHaveBeenCalledWith('write')
+    expect(controller.getSnapshot().panel?.id).toBe(permissionsPanelId)
     expect(controller.getSnapshot().panel?.rows.find((row) => row.label === 'write')?.control).toEqual({
       kind: 'toggle',
       checked: true,
@@ -1777,8 +1808,50 @@ describe('ChatController', () => {
       checked: false,
     })
 
-    await controller.submit('/permissions default')
     expect(target.setPermissionMode).toHaveBeenLastCalledWith('default')
+  })
+
+  it('toggles built-in tools through /tools and applies the selection on close', async () => {
+    const apply = vi.fn()
+    const controller = new ChatController(backend(), {
+      builtinTools: {
+        choices: () => [
+          { name: 'shell', description: 'Run shell commands', enabled: true },
+          { name: 'web_search', description: 'Search the web', enabled: false, thirdParty: true },
+        ],
+        apply,
+      },
+    })
+
+    await controller.submit('/tools')
+    expect(controller.getSnapshot().panel).toMatchObject({
+      kind: 'tools',
+      rows: [
+        { label: 'shell', control: { kind: 'toggle', checked: true } },
+        { label: 'web_search', tone: 'warning', control: { kind: 'toggle', checked: false } },
+      ],
+    })
+    const panelId = controller.getSnapshot().panel?.id
+
+    await controller.activatePanelRow(controller.getSnapshot().panel!.rows[1]!)
+    expect(controller.getSnapshot().panel?.id).toBe(panelId)
+    expect(controller.getSnapshot().panel?.rows[1]?.control).toEqual({ kind: 'toggle', checked: true })
+    expect(apply).not.toHaveBeenCalled()
+
+    expect(controller.dismissPanel()).toBe(true)
+    expect(apply).toHaveBeenCalledWith(['shell', 'web_search'])
+    expect(controller.getSnapshot().panel).toBeUndefined()
+  })
+
+  it('closes /tools without reloading when nothing changed', async () => {
+    const apply = vi.fn()
+    const controller = new ChatController(backend(), {
+      builtinTools: { choices: () => [{ name: 'shell', description: 'Run shell commands', enabled: true }], apply },
+    })
+
+    await controller.submit('/tools')
+    controller.dismissPanel()
+    expect(apply).not.toHaveBeenCalled()
   })
 
   it('toggles reasoning visibility through terminal settings', async () => {

@@ -2,18 +2,19 @@
 
 Provides real-time audio and text interaction through persistent streaming connections.
 Unlike traditional request-response patterns, this agent maintains long-running
-conversations where users can interrupt, provide additional input, and receive
+conversations where users can barge in, provide additional input, and receive
 continuous responses including audio output.
 
 Key capabilities:
 
 - Persistent conversation connections with concurrent processing
 - Real-time audio input/output streaming
-- Automatic interruption detection and tool execution
+- Automatic barge-in detection and tool execution
 - Event-driven communication with model providers
 """
 
 import asyncio
+import copy
 import logging
 import uuid
 from collections.abc import AsyncGenerator
@@ -22,7 +23,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from .... import _identifier
 from ...._middleware import MiddlewareRegistry
 from ....agent.state import AgentState
-from ....hooks import AgentInitializedEvent, HookCallback, HookOrder, HookProvider, HookRegistry, MessageAddedEvent
+from ....hooks import (
+    AgentInitializedEvent,
+    HookCallback,
+    HookOrder,
+    HookProvider,
+    HookRegistry,
+    MessageAddedEvent,
+    MessageUpdatedEvent,
+)
 from ....hooks.registry import TEvent
 from ....interrupt import _InterruptState
 from ....tools._caller import _ToolCaller
@@ -31,6 +40,15 @@ from ....tools.executors._executor import ToolExecutor
 from ....tools.registry import ToolRegistry
 from ....tools.tool_provider import ToolProvider
 from ....tools.watcher import ToolWatcher
+from ....types._snapshot import (
+    BIDI_SNAPSHOT_FIELDS,
+    BIDI_SNAPSHOT_PRESETS,
+    SNAPSHOT_SCHEMA_VERSION,
+    Snapshot,
+    SnapshotField,
+    SnapshotPreset,
+    resolve_snapshot_fields,
+)
 from ....types.agent import LocalAgent
 from ....types.content import (
     Message,
@@ -40,6 +58,7 @@ from ....types.content import (
     _ensure_tracking_id,
     split_system_prompt,
 )
+from ....types.exceptions import SnapshotException
 from ....types.media import ImageBlock
 from ....types.tools import AgentTool
 from .._async import _TaskGroup, stop_all
@@ -63,7 +82,7 @@ class BidiAgent(LocalAgent):
     """Agent for bidirectional streaming conversations.
 
     Enables real-time audio and text interaction with AI models through persistent
-    connections. Supports concurrent tool execution and interruption handling.
+    connections. Supports concurrent tool execution and barge-in handling.
     """
 
     _is_strands_local_agent: ClassVar[Literal[True]] = True
@@ -380,6 +399,86 @@ class BidiAgent(LocalAgent):
         self._started = False
         await self._loop.stop()
 
+    def take_snapshot(
+        self,
+        *,
+        preset: SnapshotPreset | None = None,
+        include: list[SnapshotField] | None = None,
+        exclude: list[SnapshotField] | None = None,
+        app_data: dict[str, Any] | None = None,
+    ) -> Snapshot:
+        """Capture current agent state as an in-memory snapshot.
+
+        Captures committed conversation history and application state. Live connection
+        state, in-progress responses, and pending tool calls are not included.
+
+        Args:
+            preset: Named preset of fields to capture. Currently only "session" is supported,
+                which captures messages and state.
+            include: Additional fields to capture on top of the preset.
+            exclude: Fields to remove after applying preset and include.
+            app_data: Application-owned arbitrary JSON stored verbatim in the snapshot.
+
+        Returns:
+            A Snapshot containing the captured agent state.
+
+        Raises:
+            SnapshotException: If no fields are resolved or a field is invalid or unsupported.
+        """
+        for snapshot_field in [*(include or []), *(exclude or [])]:
+            if snapshot_field not in BIDI_SNAPSHOT_FIELDS:
+                raise SnapshotException(
+                    f"Invalid snapshot field: {snapshot_field!r}. Valid fields: {sorted(BIDI_SNAPSHOT_FIELDS)}"
+                )
+        preset_fields = BIDI_SNAPSHOT_PRESETS[preset] if preset is not None else ()
+        fields = resolve_snapshot_fields(include=[*preset_fields, *(include or [])], exclude=exclude)
+
+        data: dict[str, Any] = {}
+        if "messages" in fields:
+            data["messages"] = copy.deepcopy(self.messages)
+        if "state" in fields:
+            data["state"] = self.state.get()
+        if "system_prompt" in fields:
+            # Store the content-block representation so round-trips preserve caching hints and
+            # other block-level metadata.
+            data["system_prompt"] = copy.deepcopy(self._system_prompt_content)
+
+        return Snapshot(
+            scope="agent",
+            schema_version=SNAPSHOT_SCHEMA_VERSION,
+            data=data,
+            app_data=copy.deepcopy(app_data) if app_data else {},
+        )
+
+    def load_snapshot(self, snapshot: Snapshot) -> None:
+        """Restore agent state from a previously captured snapshot.
+
+        Only fields present in snapshot.data are restored; absent fields are left unchanged and
+        fields this agent does not support are ignored. The restored history is sent to the model
+        on the next start().
+
+        Args:
+            snapshot: The snapshot to restore from.
+
+        Raises:
+            SnapshotException: If snapshot.schema_version is not "1.0" or snapshot.scope is not "agent".
+            RuntimeError: If the agent is started.
+        """
+        if self._started:
+            raise RuntimeError("agent started | call stop before loading a snapshot")
+        snapshot.validate()
+        if snapshot.scope != "agent":
+            raise SnapshotException(f"Expected snapshot scope 'agent', got {snapshot.scope!r}")
+
+        data = snapshot.data
+
+        if "messages" in data:
+            self.messages = copy.deepcopy(data["messages"])
+        if "state" in data:
+            self.state = AgentState(data["state"])
+        if "system_prompt" in data:
+            self.system_prompt = copy.deepcopy(data["system_prompt"])
+
     async def __aenter__(self, invocation_state: dict[str, Any] | None = None) -> "BidiAgent":
         """Async context manager entry point.
 
@@ -493,3 +592,29 @@ class BidiAgent(LocalAgent):
                 _ensure_tracking_id(message)
                 self.messages.append(message)
                 await self.hooks.invoke_callbacks_async(MessageAddedEvent[LocalAgent](agent=self, message=message))
+
+    async def _update_message(self, message: Message, *, strict: bool = True) -> None:
+        """Replace a message by its tracking ID and notify hooks.
+
+        Search newest messages first.
+
+        Args:
+            message: Replacement message carrying the original tracking ID.
+            strict: Raise if the message is missing. Otherwise, log a warning.
+
+        Raises:
+            RuntimeError: If the message is missing and strict is True.
+        """
+        tracking_id = message["tracking_id"]
+        async with self._message_lock:
+            for index in range(len(self.messages) - 1, -1, -1):
+                if self.messages[index].get("tracking_id") != tracking_id:
+                    continue
+                self.messages[index] = message
+                break
+            else:
+                if strict:
+                    raise RuntimeError(f"tracking_id=<{tracking_id}> | message not found in history")
+                logger.warning("tracking_id=<%s> | message not found in history", tracking_id)
+                return
+        await self.hooks.invoke_callbacks_async(MessageUpdatedEvent[LocalAgent](self, tracking_id, message))
